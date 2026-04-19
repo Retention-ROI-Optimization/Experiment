@@ -30,9 +30,6 @@ artifacts/**
 !artifacts/results/
 !artifacts/results/paper_latency/
 
-# Keep only reviewer-facing core experiment outputs
-!artifacts/results/paper_latency/block_level_metrics.csv
-!artifacts/results/paper_latency/summary_metrics.csv
 
 # Raw simulator outputs, caches, trained models, and intermediate training dumps
 artifacts/raw_grid/**
