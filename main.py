@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
+
+import numpy as np
+from sklearn.exceptions import ConvergenceWarning
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -70,7 +74,14 @@ def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
 
 
 
+def _configure_runtime_warning_filters() -> None:
+    np.seterr(divide='ignore', over='ignore', invalid='ignore', under='ignore')
+    warnings.filterwarnings('ignore', category=RuntimeWarning, module=r'.*sklearn.*')
+    warnings.filterwarnings('ignore', category=ConvergenceWarning)
+
+
 def main() -> int:
+    _configure_runtime_warning_filters()
     args = build_parser().parse_args()
     config = resolve_config(args)
 

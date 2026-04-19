@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import warnings
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,7 +15,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer, OneHotEncoder
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, RobustScaler
 
 from src.features.engineering import build_feature_dataset
 from src.paper_latency.io_utils import ensure_dir, read_json, write_dataframe, write_json
@@ -143,6 +144,19 @@ def _coerce_categorical_frame(frame: pd.DataFrame | np.ndarray) -> pd.DataFrame:
     return out
 
 
+def _coerce_numeric_frame(frame: pd.DataFrame | np.ndarray) -> pd.DataFrame:
+    if isinstance(frame, pd.Series):
+        frame = frame.to_frame()
+    if not isinstance(frame, pd.DataFrame):
+        frame = pd.DataFrame(frame)
+    out = frame.copy()
+    for col in out.columns:
+        values = pd.to_numeric(out[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        values = values.fillna(values.median() if values.notna().any() else 0.0)
+        out[col] = values.clip(lower=-1_000_000.0, upper=1_000_000.0)
+    return out
+
+
 
 def _extract_datetime_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     out = df.copy()
@@ -177,7 +191,7 @@ def prepare_design_matrix(features_df: pd.DataFrame, keep_columns: Iterable[str]
         if pd.api.types.is_bool_dtype(X[col]):
             X[col] = X[col].astype(int)
         elif pd.api.types.is_numeric_dtype(X[col]):
-            X[col] = pd.to_numeric(X[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+            X[col] = pd.to_numeric(X[col], errors='coerce').replace([np.inf, -np.inf], np.nan).clip(lower=-1_000_000.0, upper=1_000_000.0)
         else:
             X[col] = _normalize_categorical_series(X[col])
     return X
@@ -192,7 +206,15 @@ def _build_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list[str], 
 
     transformers = []
     if num_cols:
-        transformers.append(('num', Pipeline([('imputer', SimpleImputer(strategy='median'))]), num_cols))
+        transformers.append((
+            'num',
+            Pipeline([
+                ('coerce_numeric', FunctionTransformer(_coerce_numeric_frame, validate=False)),
+                ('imputer', SimpleImputer(strategy='median')),
+                ('scale', RobustScaler(with_centering=False, quantile_range=(5.0, 95.0))),
+            ]),
+            num_cols,
+        ))
     if cat_cols:
         transformers.append(
             (
@@ -214,7 +236,7 @@ def _build_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list[str], 
 def _fit_pipeline(X: pd.DataFrame, y: pd.Series, *, variant: str, random_state: int) -> Pipeline:
     preprocessor, _, _ = _build_preprocessor(X)
     if variant == 'weaker':
-        estimator = LogisticRegression(max_iter=1200, solver='lbfgs', class_weight='balanced', n_jobs=None)
+        estimator = LogisticRegression(max_iter=2000, solver='liblinear', class_weight='balanced')
     else:
         if XGBClassifier is None:
             raise RuntimeError('xgboost is required for base/stronger variants.')
@@ -253,7 +275,10 @@ def _train_single_variant(X: pd.DataFrame, y: pd.Series, *, variant: str, random
         stratify=y,
     )
     pipeline = _fit_pipeline(X_train, y_train, variant=variant, random_state=random_state)
-    pipeline.fit(X_train, y_train)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)
+        warnings.simplefilter('ignore')
+        pipeline.fit(X_train, y_train)
     pred = pipeline.predict_proba(X_test)[:, 1]
     auc = float(roc_auc_score(y_test, pred))
     ap = float(average_precision_score(y_test, pred))

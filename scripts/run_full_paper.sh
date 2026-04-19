@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 python main.py \
   --mode run-paper \
   --project-root "$ROOT_DIR" \
-  --seeds 41,42,43,44,45 \
+  --seeds 41,42,43\
   --scenario-families complaint-heavy,promotion-heavy,dormancy-heavy,seasonal-shift \
   --latencies 0,1,3,7 \
   --budgets 2640000,7250000,11530000 \

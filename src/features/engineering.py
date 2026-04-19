@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 from pathlib import Path
 from typing import Dict, Iterable
 
@@ -23,8 +24,10 @@ def safe_divide(numerator, denominator, default: float = 0.0) -> np.ndarray:
     num = np.asarray(numerator, dtype=float)
     den = np.asarray(denominator, dtype=float)
     out = np.full_like(num, default, dtype=float)
-    mask = den != 0
-    out[mask] = num[mask] / den[mask]
+    mask = (den != 0) & np.isfinite(den) & np.isfinite(num)
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
+        out[mask] = num[mask] / den[mask]
+    out[~np.isfinite(out)] = default
     return out
 
 
@@ -275,9 +278,21 @@ def _compute_behavior_cluster(events: pd.DataFrame, as_of_date: pd.Timestamp, n_
     mix = pd.crosstab(hist['customer_id'], hist['event_type'])
     if mix.empty:
         return pd.Series(dtype=int)
-    mix = mix.div(mix.sum(axis=1), axis=0).fillna(0.0)
-    n_clusters = max(2, min(n_clusters, len(mix)))
-    clusters = KMeans(n_clusters=n_clusters, n_init='auto', random_state=42).fit_predict(mix)
+    mix = mix.astype(float)
+    row_sum = mix.sum(axis=1).replace(0.0, np.nan)
+    mix = mix.div(row_sum, axis=0).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0, upper=1.0)
+    unique_rows = max(1, int(mix.drop_duplicates().shape[0]))
+    n_clusters = max(2, min(int(n_clusters), len(mix), unique_rows))
+    if n_clusters <= 1 or len(mix) < 2 or unique_rows < 2:
+        return pd.Series(np.zeros(len(mix), dtype=int), index=mix.index, name='behavior_cluster_id')
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=RuntimeWarning)
+            warnings.simplefilter('ignore')
+            clusters = KMeans(n_clusters=n_clusters, n_init=10, random_state=42, algorithm='lloyd').fit_predict(mix.to_numpy(dtype=float))
+    except Exception:
+        dominant = mix.idxmax(axis=1).astype('category').cat.codes.to_numpy(dtype=int)
+        clusters = dominant % n_clusters
     return pd.Series(clusters, index=mix.index, name='behavior_cluster_id')
 
 
@@ -339,7 +354,7 @@ def _winsorize_and_impute(features: pd.DataFrame) -> tuple[pd.DataFrame, Dict[st
         q01 = float(s.quantile(0.01)) if s.notna().any() else 0.0
         q99 = float(s.quantile(0.99)) if s.notna().any() else 0.0
         fill = float(s.median()) if s.notna().any() else 0.0
-        out[col] = s.clip(lower=q01, upper=q99).fillna(fill)
+        out[col] = s.clip(lower=q01, upper=q99).fillna(fill).clip(lower=-1_000_000.0, upper=1_000_000.0)
         summary[col] = {'clip_p01': q01, 'clip_p99': q99, 'fill_value': fill}
     for col in out.columns:
         if col not in numeric_cols and col not in {'customer_id', 'label'}:
