@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments / local tools
+.venv/
+venv/
+env/
+.python-version
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+
+# Generated experiment artifacts: ignore everything by default
+artifacts/**
+
+# But keep the directories themselves if needed
+!artifacts/
+!artifacts/results/
+!artifacts/results/paper_latency/
+
+# Keep only reviewer-facing core experiment outputs
+!artifacts/results/paper_latency/block_level_metrics.csv
+!artifacts/results/paper_latency/summary_metrics.csv
+
+# Raw simulator outputs, caches, trained models, and intermediate training dumps
+artifacts/raw_grid/**
+artifacts/feature_cache/**
+artifacts/models/**
+artifacts/results/training/**
+artifacts/results/**/*.joblib
+artifacts/results/**/*.parquet
+artifacts/results/**/*.pkl
+artifacts/results/**/*.npy
+artifacts/results/**/*.npz
+artifacts/results/**/*.feather
+artifacts/results/**/*.xlsx
+artifacts/results/**/*.log
+
+# Keep placeholder files only if you want empty dirs in git
+!artifacts/raw_grid/.gitkeep
+!artifacts/feature_cache/.gitkeep
+!artifacts/models/.gitkeep
+!artifacts/results/.gitkeep
