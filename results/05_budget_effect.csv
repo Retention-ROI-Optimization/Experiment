@@ -1,0 +1,13 @@
+﻿budget_M,policy_kind,policy_value_M,stale_regret_M,relative_loss_%,selected_customers
+2.64,base-stale,76.67,-0.51,-0.81,250.9
+2.64,full-refresh,76.16,0.0,0.0,253.8
+2.64,stronger-but-stale,80.46,-4.3,-5.38,233.5
+2.64,weaker-but-fresh,35.82,40.34,51.82,458.2
+7.25,base-stale,155.09,-0.93,-0.6,756.4
+7.25,full-refresh,154.16,0.0,0.0,769.0
+7.25,stronger-but-stale,162.03,-7.87,-4.75,697.2
+7.25,weaker-but-fresh,93.86,60.3,37.89,1246.2
+11.53,base-stale,200.62,-0.67,-0.28,1384.9
+11.53,full-refresh,199.95,0.0,0.0,1392.2
+11.53,stronger-but-stale,206.17,-6.23,-2.68,1324.5
+11.53,weaker-but-fresh,145.94,54.0,24.53,1954.5

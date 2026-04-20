@@ -1,0 +1,5 @@
+﻿latency_days,policy_value_M,stale_regret_M,relative_loss_%,target_overlap_%,missed_at_risk_%,window_miss_%
+0,143.42,0.0,0.0,100.0,0.0,0.0
+1,144.52,-1.09,-0.872,88.63,15.85,0.303
+3,144.39,-0.97,-0.78,88.23,16.33,0.444
+7,144.17,-0.75,-0.609,87.52,17.15,1.529
