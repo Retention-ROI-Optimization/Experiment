@@ -1,0 +1,5 @@
+﻿policy_kind,policy_value_M,stale_regret_M,relative_loss_%,target_overlap_%,missed_at_risk_%,window_miss_%,selected_customers
+base-stale,144.13,-0.7,-0.57,91.1,12.33,0.569,797.4
+full-refresh,143.42,0.0,0.0,100.0,0.0,0.0,805.0
+stronger-but-stale,149.55,-6.13,-4.27,78.39,32.83,1.338,751.7
+weaker-but-fresh,91.87,51.55,38.08,74.01,4.0,0.0,1219.6
