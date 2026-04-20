@@ -69,3 +69,12 @@ def parse_str_list(raw: str | Iterable[str] | None, default: Sequence[str]) -> t
         values = [item.strip() for item in raw.split(',') if item.strip()]
         return tuple(values)
     return tuple(str(x) for x in raw)
+
+
+def parse_float_list(raw: str | Iterable[float] | None, default: Sequence[float]) -> tuple[float, ...]:
+    if raw is None:
+        return tuple(float(x) for x in default)
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(',') if item.strip()]
+        return tuple(float(x) for x in values)
+    return tuple(float(x) for x in raw)

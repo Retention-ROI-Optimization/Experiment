@@ -146,30 +146,21 @@ def _bootstrap_interval(values: np.ndarray, *, iterations: int, rng: np.random.G
 
 
 
-def _summarize_block_metrics(block_metrics: pd.DataFrame, *, bootstrap_iterations: int, random_state: int) -> pd.DataFrame:
+def _summarize_metrics(
+    df: pd.DataFrame,
+    *,
+    group_cols: list[str],
+    metric_cols: list[str],
+    bootstrap_iterations: int,
+    random_state: int,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    group_cols = ['scenario_family', 'budget', 'policy_kind', 'latency_days']
-    metric_cols = [
-        'policy_value',
-        'stale_regret',
-        'relative_loss',
-        'target_overlap',
-        'missed_at_risk',
-        'window_miss_rate',
-        'selected_customers',
-        'partial_reopt_optimization_call_ratio',
-        'partial_reopt_regret_recovery_ratio',
-        'partial_reopt_full_refresh_value_ratio',
-    ]
-    grouped = block_metrics.groupby(group_cols, dropna=False)
-    for idx, ((scenario_family, budget, policy_kind, latency_days), group) in enumerate(grouped):
-        row: dict[str, Any] = {
-            'scenario_family': scenario_family,
-            'budget': int(budget),
-            'policy_kind': policy_kind,
-            'latency_days': int(latency_days),
-            'block_count': int(len(group)),
-        }
+    grouped = df.groupby(group_cols, dropna=False)
+    for idx, (group_key, group) in enumerate(grouped):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        row: dict[str, Any] = {column: value for column, value in zip(group_cols, group_key)}
+        row['block_count'] = int(len(group))
         for metric in metric_cols:
             values = pd.to_numeric(group.get(metric, pd.Series(dtype=float)), errors='coerce').dropna().to_numpy(dtype=float)
             rng = np.random.default_rng(random_state + idx * 97 + len(metric))
@@ -179,6 +170,28 @@ def _summarize_block_metrics(block_metrics: pd.DataFrame, *, bootstrap_iteration
             row[f'{metric}_ci_high'] = round(high, 6)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+
+def _summarize_block_metrics(block_metrics: pd.DataFrame, *, bootstrap_iterations: int, random_state: int) -> pd.DataFrame:
+    return _summarize_metrics(
+        block_metrics,
+        group_cols=['scenario_family', 'budget', 'policy_kind', 'latency_days'],
+        metric_cols=[
+            'policy_value',
+            'stale_regret',
+            'relative_loss',
+            'target_overlap',
+            'missed_at_risk',
+            'window_miss_rate',
+            'selected_customers',
+            'partial_reopt_optimization_call_ratio',
+            'partial_reopt_regret_recovery_ratio',
+            'partial_reopt_full_refresh_value_ratio',
+        ],
+        bootstrap_iterations=bootstrap_iterations,
+        random_state=random_state,
+    )
 
 
 
@@ -207,19 +220,21 @@ def run_rolling_latency_evaluation(config: ExperimentConfig, *, force: bool = Fa
         _, decision_dates = _decision_schedule(data_dir, burn_in_weeks=config.burn_in_weeks, limit=config.decision_week_limit)
 
         for decision_date in decision_dates:
+            eval_latencies = tuple(sorted(set(config.latencies)))
+            required_latencies = tuple(sorted({0, *eval_latencies}))
             raw_feature_snapshots = _fresh_and_stale_snapshots(
                 cache=cache,
                 data_dir=data_dir,
                 decision_date=decision_date,
-                latencies=tuple(sorted(set(config.latencies))),
+                latencies=required_latencies,
             )
 
             for family in config.scenario_families:
+                fresh_features = apply_scenario_family(raw_feature_snapshots[0], family, decision_date).features
                 family_snapshots = {
                     latency: apply_scenario_family(raw_feature_snapshots[latency], family, decision_date).features
-                    for latency in config.latencies
+                    for latency in eval_latencies
                 }
-                fresh_features = family_snapshots[0]
                 fresh_base_scores = _score_variant(models['base'], fresh_features)
                 fresh_policy_by_budget = {
                     budget: run_policy_selection(
@@ -396,6 +411,205 @@ def run_rolling_latency_evaluation(config: ExperimentConfig, *, force: bool = Fa
             'burn_in_weeks': int(config.burn_in_weeks),
             'decision_week_limit': config.decision_week_limit,
             'bootstrap_iterations': int(config.bootstrap_iterations),
+        },
+    }
+    write_json(manifest_path, manifest)
+    return manifest
+
+
+
+
+
+def _theta_grid_slug(theta_grid: tuple[float, ...]) -> str:
+    def _fmt(value: float) -> str:
+        return f'{float(value):.3f}'.rstrip('0').rstrip('.').replace('-', 'm').replace('.', 'p')
+
+    return '__'.join(_fmt(value) for value in theta_grid)
+
+
+
+def run_theta_sensitivity(
+    config: ExperimentConfig,
+    *,
+    theta_grid: tuple[float, ...],
+    force: bool = False,
+) -> dict[str, Any]:
+    if not theta_grid:
+        raise PaperExperimentError('theta_grid must not be empty.')
+
+    prepare_simulation_grid(config, force=False)
+    train_all_seed_variants(config, force=False)
+
+    theta_grid = tuple(sorted({round(float(theta), 6) for theta in theta_grid}))
+    slug = _theta_grid_slug(theta_grid)
+    result_root = ensure_dir(config.result_dir / 'paper_latency' / 'theta_sensitivity' / slug)
+    block_metrics_path = result_root / 'theta_block_level_metrics.csv'
+    latency_summary_path = result_root / 'theta_summary_by_latency.csv'
+    overall_summary_path = result_root / 'theta_summary_overall.csv'
+    manifest_path = result_root / 'manifest.json'
+    if (not force) and block_metrics_path.exists() and latency_summary_path.exists() and overall_summary_path.exists() and manifest_path.exists():
+        return read_json(manifest_path)
+
+    rows: list[dict[str, Any]] = []
+    metric_cols = [
+        'base_policy_value',
+        'base_stale_regret',
+        'base_relative_loss',
+        'base_target_overlap',
+        'base_missed_at_risk',
+        'base_window_miss_rate',
+        'partial_reopt_policy_value',
+        'partial_reopt_stale_regret',
+        'partial_reopt_regret_recovery_ratio',
+        'partial_reopt_full_refresh_value_ratio',
+        'partial_reopt_optimization_call_ratio',
+    ]
+
+    for seed in config.seeds:
+        data_dir = _seed_raw_dir(config, seed)
+        models = _load_seed_models(config, seed)
+        cache = FeatureCache(config.cache_dir / f'seed_{seed}', horizon_days=config.horizon_days)
+        _, decision_dates = _decision_schedule(data_dir, burn_in_weeks=config.burn_in_weeks, limit=config.decision_week_limit)
+
+        for decision_date in decision_dates:
+            eval_latencies = tuple(sorted(set(config.latencies)))
+            required_latencies = tuple(sorted({0, *eval_latencies}))
+            raw_feature_snapshots = _fresh_and_stale_snapshots(
+                cache=cache,
+                data_dir=data_dir,
+                decision_date=decision_date,
+                latencies=required_latencies,
+            )
+
+            for family in config.scenario_families:
+                fresh_features = apply_scenario_family(raw_feature_snapshots[0], family, decision_date).features
+                family_snapshots = {
+                    latency: apply_scenario_family(raw_feature_snapshots[latency], family, decision_date).features
+                    for latency in eval_latencies
+                }
+                fresh_base_scores = _score_variant(models['base'], fresh_features)
+                fresh_policy_by_budget = {
+                    budget: run_policy_selection(
+                        fresh_features=fresh_features,
+                        churn_scores=fresh_base_scores,
+                        budget=budget,
+                        scenario_family=family,
+                        decision_date=decision_date,
+                        use_learned_dose_response=config.use_learned_dose_response,
+                    )
+                    for budget in config.budgets
+                }
+
+                for latency in config.latencies:
+                    stale_features = family_snapshots[latency]
+                    base_scores = _score_variant(models['base'], stale_features)
+
+                    for budget in config.budgets:
+                        fresh_policy = fresh_policy_by_budget[budget]
+                        stale_policy = run_policy_selection(
+                            fresh_features=fresh_features,
+                            churn_scores=base_scores,
+                            budget=budget,
+                            scenario_family=family,
+                            decision_date=decision_date,
+                            use_learned_dose_response=config.use_learned_dose_response,
+                        )
+                        stale_metrics = compute_policy_comparison_metrics(
+                            fresh_selection=fresh_policy,
+                            candidate_selection=stale_policy,
+                            latency_days=latency,
+                        )
+
+                        for theta in theta_grid:
+                            partial_policy, partial_meta = partial_reoptimization(
+                                stale_scores=base_scores,
+                                fresh_scores=fresh_base_scores,
+                                fresh_features=fresh_features,
+                                stale_selection=stale_policy,
+                                budget=budget,
+                                scenario_family=family,
+                                decision_date=decision_date,
+                                score_delta_threshold=float(theta),
+                                high_risk_threshold=config.partial_reopt_high_risk_threshold,
+                                top_share=config.partial_reopt_top_share,
+                                use_learned_dose_response=config.use_learned_dose_response,
+                            )
+                            partial_metrics = compute_policy_comparison_metrics(
+                                fresh_selection=fresh_policy,
+                                candidate_selection=partial_policy,
+                                latency_days=latency,
+                            )
+                            rows.append(
+                                {
+                                    'seed': int(seed),
+                                    'scenario_family': family,
+                                    'decision_date': str(pd.Timestamp(decision_date).date()),
+                                    'budget': int(budget),
+                                    'latency_days': int(latency),
+                                    'theta': float(theta),
+                                    'high_risk_threshold': float(config.partial_reopt_high_risk_threshold),
+                                    'top_share': float(config.partial_reopt_top_share),
+                                    'base_policy_value': round(stale_metrics['policy_value'], 6),
+                                    'base_stale_regret': round(stale_metrics['stale_regret'], 6),
+                                    'base_relative_loss': round(stale_metrics['relative_loss'], 6),
+                                    'base_target_overlap': round(stale_metrics['target_overlap'], 6),
+                                    'base_missed_at_risk': round(stale_metrics['missed_at_risk'], 6),
+                                    'base_window_miss_rate': round(stale_metrics['window_miss_rate'], 6),
+                                    'partial_reopt_policy_value': round(partial_metrics['policy_value'], 6),
+                                    'partial_reopt_stale_regret': round(partial_metrics['stale_regret'], 6),
+                                    'partial_reopt_regret_recovery_ratio': round(
+                                        (stale_metrics['stale_regret'] - partial_metrics['stale_regret']) / max(abs(stale_metrics['stale_regret']), 1.0),
+                                        6,
+                                    ),
+                                    'partial_reopt_full_refresh_value_ratio': round(
+                                        _full_refresh_ratio(partial_metrics['policy_value'], fresh_policy.summary['policy_value']),
+                                        6,
+                                    ),
+                                    'partial_reopt_optimization_call_ratio': float(partial_meta['optimization_call_ratio']),
+                                }
+                            )
+
+    theta_block_metrics = pd.DataFrame(rows)
+    if theta_block_metrics.empty:
+        raise PaperExperimentError('No theta sensitivity metrics were generated.')
+
+    latency_summary = _summarize_metrics(
+        theta_block_metrics,
+        group_cols=['theta', 'latency_days'],
+        metric_cols=metric_cols,
+        bootstrap_iterations=config.bootstrap_iterations,
+        random_state=config.random_state,
+    )
+    overall_summary = _summarize_metrics(
+        theta_block_metrics,
+        group_cols=['theta'],
+        metric_cols=metric_cols,
+        bootstrap_iterations=config.bootstrap_iterations,
+        random_state=config.random_state + 701,
+    )
+
+    write_dataframe(block_metrics_path, theta_block_metrics)
+    write_dataframe(latency_summary_path, latency_summary)
+    write_dataframe(overall_summary_path, overall_summary)
+
+    manifest = {
+        'theta_block_metrics_path': str(block_metrics_path),
+        'theta_summary_by_latency_path': str(latency_summary_path),
+        'theta_summary_overall_path': str(overall_summary_path),
+        'rows': int(len(theta_block_metrics)),
+        'latency_summary_rows': int(len(latency_summary)),
+        'overall_summary_rows': int(len(overall_summary)),
+        'config': {
+            'seeds': list(config.seeds),
+            'scenario_families': list(config.scenario_families),
+            'latencies': list(config.latencies),
+            'budgets': list(config.budgets),
+            'burn_in_weeks': int(config.burn_in_weeks),
+            'decision_week_limit': config.decision_week_limit,
+            'bootstrap_iterations': int(config.bootstrap_iterations),
+            'theta_grid': list(theta_grid),
+            'partial_reopt_high_risk_threshold': float(config.partial_reopt_high_risk_threshold),
+            'partial_reopt_top_share': float(config.partial_reopt_top_share),
         },
     }
     write_json(manifest_path, manifest)

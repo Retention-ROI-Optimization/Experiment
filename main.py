@@ -3,11 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import warnings
 from pathlib import Path
-
-import numpy as np
-from sklearn.exceptions import ConvergenceWarning
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -19,6 +15,7 @@ from src.paper_latency.config import (
     DEFAULT_SCENARIO_FAMILIES,
     DEFAULT_SEEDS,
     ExperimentConfig,
+    parse_float_list,
     parse_int_list,
     parse_str_list,
 )
@@ -26,8 +23,12 @@ from src.paper_latency.evaluation import (
     prepare_simulation_grid,
     run_full_paper_pipeline,
     run_rolling_latency_evaluation,
+    run_theta_sensitivity,
     train_all_seed_variants,
 )
+
+
+DEFAULT_THETA_GRID: tuple[float, ...] = (0.05, 0.10, 0.15)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,10 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--partial-reopt-score-delta', type=float, default=0.10)
     parser.add_argument('--partial-reopt-high-risk-threshold', type=float, default=0.80)
     parser.add_argument('--partial-reopt-top-share', type=float, default=0.15)
+    parser.add_argument('--theta-grid', default=','.join(f'{x:.2f}' for x in DEFAULT_THETA_GRID), help='Comma-separated theta grid for sensitivity sweep; mapped to partial_reopt_score_delta while other partial reopt knobs stay fixed.')
     parser.add_argument('--stronger-vs-weaker-latency-days', type=int, default=3)
     parser.add_argument('--use-learned-dose-response', action='store_true')
     parser.add_argument('--force', action='store_true')
-    parser.add_argument('--mode', required=True, choices=['prepare-grid', 'train-variants', 'run-rolling', 'run-paper'])
+    parser.add_argument('--mode', required=True, choices=['prepare-grid', 'train-variants', 'run-rolling', 'run-paper', 'run-theta-sensitivity'])
     return parser
 
 
@@ -74,14 +76,7 @@ def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
 
 
 
-def _configure_runtime_warning_filters() -> None:
-    np.seterr(divide='ignore', over='ignore', invalid='ignore', under='ignore')
-    warnings.filterwarnings('ignore', category=RuntimeWarning, module=r'.*sklearn.*')
-    warnings.filterwarnings('ignore', category=ConvergenceWarning)
-
-
 def main() -> int:
-    _configure_runtime_warning_filters()
     args = build_parser().parse_args()
     config = resolve_config(args)
 
@@ -93,6 +88,12 @@ def main() -> int:
         payload = run_rolling_latency_evaluation(config, force=args.force)
     elif args.mode == 'run-paper':
         payload = run_full_paper_pipeline(config, force=args.force)
+    elif args.mode == 'run-theta-sensitivity':
+        payload = run_theta_sensitivity(
+            config,
+            theta_grid=parse_float_list(args.theta_grid, DEFAULT_THETA_GRID),
+            force=args.force,
+        )
     else:  # pragma: no cover
         raise SystemExit(f'Unsupported mode: {args.mode}')
 
