@@ -63,3 +63,8 @@ artifacts/results/**/*.npz
 artifacts/results/**/*.feather
 artifacts/results/**/*.xlsx
 artifacts/results/**/*.log
+
+# Keep theta sensitivity result files
+!artifacts/results/paper_latency/theta_sensitivity/
+!artifacts/results/paper_latency/theta_sensitivity/0p05_0p10_0p15/
+!artifacts/results/paper_latency/theta_sensitivity/0p05_0p10_0p15/**
