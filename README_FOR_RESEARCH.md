@@ -224,3 +224,25 @@ mkdir -p artifacts/feature_cache
 
 
 
+
+
+## Added in this patch: matched-cost re-optimization baselines
+
+The rolling latency evaluation now exports additional block-level and summary metrics for three same-call-ratio baselines compared against partial re-optimization:
+
+- `random_refresh_*`: randomly chosen customers are re-scored using the fresh score.
+- `top_risk_refresh_*`: the highest-risk customers under the stale score are re-scored.
+- `top_value_refresh_*`: customers with the largest stale-policy expected incremental profit are re-scored.
+
+Each baseline uses the **same number of re-optimized customers** as the partial re-optimization rule in the same seed/week/scenario/budget/latency block, so the comparison is on *who to refresh*, not on *how many to refresh*.
+
+Additional columns are also exported for partial re-optimization itself:
+
+- `partial_reopt_target_overlap`, `partial_reopt_missed_at_risk`, `partial_reopt_window_miss_rate`, `partial_reopt_relative_loss`
+- `partial_reopt_target_overlap_recovery`, `partial_reopt_missed_at_risk_recovery`, `partial_reopt_window_miss_rate_recovery`
+
+Recovery definitions:
+
+- `TO_recovery = (TO_partial - TO_stale) / (1 - TO_stale)`
+- `MaR_recovery = (MaR_stale - MaR_partial) / MaR_stale`
+- `WMR_recovery = (WMR_stale - WMR_partial) / WMR_stale`

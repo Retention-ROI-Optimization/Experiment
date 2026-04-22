@@ -322,6 +322,94 @@ def compute_policy_comparison_metrics(
 
 
 
+
+
+def matched_reoptimization_policy(
+    *,
+    stale_scores: pd.Series,
+    fresh_scores: pd.Series,
+    fresh_features: pd.DataFrame,
+    budget: int,
+    scenario_family: str,
+    decision_date: str | pd.Timestamp,
+    reopt_ids: set[int],
+    use_learned_dose_response: bool = False,
+) -> tuple[PolicySelection, dict[str, Any]]:
+    stale_aligned = stale_scores.reindex(fresh_scores.index).fillna(stale_scores.mean() if len(stale_scores) else 0.5)
+    if not reopt_ids:
+        baseline_selection = run_policy_selection(
+            fresh_features=fresh_features,
+            churn_scores=stale_aligned,
+            budget=budget,
+            scenario_family=scenario_family,
+            decision_date=decision_date,
+            use_learned_dose_response=use_learned_dose_response,
+        )
+        return baseline_selection, {'reoptimized_customers': 0, 'optimization_call_ratio': 0.0}
+
+    refreshed_scores = stale_aligned.copy()
+    valid_ids = [cid for cid in reopt_ids if cid in refreshed_scores.index]
+    if valid_ids:
+        refreshed_scores.loc[valid_ids] = fresh_scores.loc[valid_ids]
+    selection = run_policy_selection(
+        fresh_features=fresh_features,
+        churn_scores=refreshed_scores,
+        budget=budget,
+        scenario_family=scenario_family,
+        decision_date=decision_date,
+        use_learned_dose_response=use_learned_dose_response,
+    )
+    return selection, {
+        'reoptimized_customers': int(len(valid_ids)),
+        'optimization_call_ratio': round(len(valid_ids) / max(len(fresh_scores), 1), 6),
+    }
+
+
+def select_random_reopt_ids(
+    customer_ids: pd.Index | pd.Series | list[int],
+    *,
+    k: int,
+    rng: np.random.Generator,
+) -> set[int]:
+    ids = pd.Index(pd.to_numeric(pd.Index(customer_ids), errors='coerce').dropna().astype(int).unique())
+    if k <= 0 or len(ids) == 0:
+        return set()
+    k = min(int(k), len(ids))
+    chosen = rng.choice(ids.to_numpy(dtype=int), size=k, replace=False)
+    return set(pd.Index(chosen).astype(int).tolist())
+
+
+def select_top_risk_reopt_ids(stale_scores: pd.Series, *, k: int) -> set[int]:
+    if k <= 0 or len(stale_scores) == 0:
+        return set()
+    ranked = stale_scores.sort_values(ascending=False)
+    return set(pd.Index(ranked.index[: min(int(k), len(ranked))]).astype(int).tolist())
+
+
+def select_top_value_reopt_ids(stale_selection: PolicySelection, *, k: int, fallback_scores: pd.Series | None = None) -> set[int]:
+    if k <= 0:
+        return set()
+    customer_value = pd.DataFrame()
+    if len(stale_selection.candidates):
+        customer_value = stale_selection.candidates[['customer_id', 'expected_incremental_profit']].copy()
+        customer_value['customer_id'] = pd.to_numeric(customer_value['customer_id'], errors='coerce').astype('Int64')
+        customer_value['expected_incremental_profit'] = pd.to_numeric(customer_value['expected_incremental_profit'], errors='coerce').fillna(0.0)
+        customer_value = customer_value.dropna(subset=['customer_id'])
+        customer_value = customer_value.groupby('customer_id', as_index=False)['expected_incremental_profit'].max()
+        customer_value = customer_value.sort_values(['expected_incremental_profit', 'customer_id'], ascending=[False, True])
+    top_ids: list[int] = []
+    if not customer_value.empty:
+        top_ids = customer_value['customer_id'].astype(int).tolist()[: int(k)]
+    if len(top_ids) >= int(k) or fallback_scores is None:
+        return set(top_ids)
+    ranked = fallback_scores.sort_values(ascending=False)
+    for cid in pd.Index(ranked.index).astype(int).tolist():
+        if cid not in top_ids:
+            top_ids.append(cid)
+        if len(top_ids) >= int(k):
+            break
+    return set(top_ids[: int(k)])
+
 def partial_reoptimization(
     *,
     stale_scores: pd.Series,
