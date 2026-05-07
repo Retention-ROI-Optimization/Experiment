@@ -39,6 +39,10 @@ class ExperimentConfig:
     partial_reopt_high_risk_threshold: float = 0.80
     partial_reopt_top_share: float = 0.15
     use_learned_dose_response: bool = False
+    # ── Conformal Risk Control ──
+    conformal_alpha_grid: tuple[float, ...] = (0.05, 0.10, 0.20)
+    conformal_min_cal_size: int = 200
+    ensemble_size: int = 5
 
     @classmethod
     def from_root(cls, project_root: str | Path, **overrides) -> 'ExperimentConfig':

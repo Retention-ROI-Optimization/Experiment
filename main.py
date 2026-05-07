@@ -21,7 +21,9 @@ from src.paper_latency.config import (
 )
 from src.paper_latency.evaluation import (
     prepare_simulation_grid,
+    run_conformal_evaluation,
     run_full_paper_pipeline,
+    run_hierarchical_evaluation,
     run_rolling_latency_evaluation,
     run_theta_sensitivity,
     train_all_seed_variants,
@@ -29,6 +31,7 @@ from src.paper_latency.evaluation import (
 
 
 DEFAULT_THETA_GRID: tuple[float, ...] = (0.05, 0.10, 0.15)
+DEFAULT_ALPHA_GRID: tuple[float, ...] = (0.05, 0.10, 0.20)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,7 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--stronger-vs-weaker-latency-days', type=int, default=3)
     parser.add_argument('--use-learned-dose-response', action='store_true')
     parser.add_argument('--force', action='store_true')
-    parser.add_argument('--mode', required=True, choices=['prepare-grid', 'train-variants', 'run-rolling', 'run-paper', 'run-theta-sensitivity'])
+    # ── Conformal Risk Control ──
+    parser.add_argument('--alpha-grid', default=','.join(f'{x:.2f}' for x in DEFAULT_ALPHA_GRID), help='Comma-separated conformal miscoverage levels α.')
+    parser.add_argument('--ensemble-size', type=int, default=5, help='Number of ensemble members for uncertainty baseline.')
+    parser.add_argument('--conformal-min-cal-size', type=int, default=200, help='Minimum calibration residuals before conformal kicks in.')
+    parser.add_argument('--hierarchical-max-call-ratio', type=float, default=0.15, help='Fixed call-ratio cap for budget-capped hierarchical arm. Use a negative value to disable fixed-cap arm.')
+    parser.add_argument('--mode', required=True, choices=['prepare-grid', 'train-variants', 'run-rolling', 'run-paper', 'run-theta-sensitivity', 'run-conformal', 'run-hierarchical'])
     return parser
 
 
@@ -72,6 +80,10 @@ def resolve_config(args: argparse.Namespace) -> ExperimentConfig:
         partial_reopt_high_risk_threshold=float(args.partial_reopt_high_risk_threshold),
         partial_reopt_top_share=float(args.partial_reopt_top_share),
         use_learned_dose_response=bool(args.use_learned_dose_response),
+        # ── Conformal Risk Control ──
+        conformal_alpha_grid=parse_float_list(args.alpha_grid, DEFAULT_ALPHA_GRID),
+        conformal_min_cal_size=int(args.conformal_min_cal_size),
+        ensemble_size=int(args.ensemble_size),
     )
 
 
@@ -92,6 +104,19 @@ def main() -> int:
         payload = run_theta_sensitivity(
             config,
             theta_grid=parse_float_list(args.theta_grid, DEFAULT_THETA_GRID),
+            force=args.force,
+        )
+    elif args.mode == 'run-conformal':
+        payload = run_conformal_evaluation(
+            config,
+            alpha_grid=parse_float_list(args.alpha_grid, DEFAULT_ALPHA_GRID),
+            force=args.force,
+        )
+    elif args.mode == 'run-hierarchical':
+        payload = run_hierarchical_evaluation(
+            config,
+            alpha_grid=parse_float_list(args.alpha_grid, DEFAULT_ALPHA_GRID),
+            hierarchical_max_call_ratio=None if float(args.hierarchical_max_call_ratio) < 0 else float(args.hierarchical_max_call_ratio),
             force=args.force,
         )
     else:  # pragma: no cover

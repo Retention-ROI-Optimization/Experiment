@@ -410,6 +410,75 @@ def select_top_value_reopt_ids(stale_selection: PolicySelection, *, k: int, fall
             break
     return set(top_ids[: int(k)])
 
+
+
+def _aligned_score_delta(
+    *,
+    stale_scores: pd.Series,
+    fresh_scores: pd.Series,
+    absolute: bool = True,
+) -> tuple[pd.Series, pd.Series]:
+    """Align stale/fresh churn scores on the fresh customer universe."""
+    stale_aligned = stale_scores.reindex(fresh_scores.index).fillna(
+        stale_scores.mean() if len(stale_scores) else 0.5,
+    )
+    delta = (fresh_scores - stale_aligned).fillna(0.0)
+    if absolute:
+        delta = delta.abs()
+    return stale_aligned, delta
+
+
+def select_partial_reopt_ids(
+    *,
+    stale_scores: pd.Series,
+    fresh_scores: pd.Series,
+    score_delta_threshold: float,
+    high_risk_threshold: float,
+    top_share: float,
+) -> set[int]:
+    """Stage-1 partial re-optimization selector.
+
+    The paper text defines partial re-optimization by the absolute score
+    change |s_fresh - s_stale|. The optional top_share guard keeps the
+    refresh set concentrated on the most volatile customers even when the
+    fixed theta is loose.
+    """
+    _, delta = _aligned_score_delta(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        absolute=True,
+    )
+    if len(delta) == 0:
+        return set()
+    share = min(max(float(top_share), 0.0), 1.0)
+    cutoff = float(delta.quantile(max(0.0, 1.0 - share))) if share > 0.0 else float('inf')
+    threshold = max(float(score_delta_threshold), cutoff)
+    reopt_mask = (delta >= threshold) | (fresh_scores >= float(high_risk_threshold))
+    return set(pd.Index(delta.index[reopt_mask]).astype(int).tolist())
+
+
+def select_conformal_reopt_ids(
+    *,
+    stale_scores: pd.Series,
+    fresh_scores: pd.Series,
+    conformal_q_hat: float,
+    high_risk_threshold: float = 0.80,
+    exclude_ids: set[int] | None = None,
+) -> set[int]:
+    """Stage-2 CRC selector for customers not already refreshed."""
+    _, delta = _aligned_score_delta(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        absolute=True,
+    )
+    if len(delta) == 0:
+        return set()
+    reopt_mask = (delta > float(conformal_q_hat)) | (fresh_scores >= float(high_risk_threshold))
+    ids = set(pd.Index(delta.index[reopt_mask]).astype(int).tolist())
+    if exclude_ids:
+        ids -= set(int(x) for x in exclude_ids)
+    return ids
+
 def partial_reoptimization(
     *,
     stale_scores: pd.Series,
@@ -424,17 +493,31 @@ def partial_reoptimization(
     top_share: float,
     use_learned_dose_response: bool = False,
 ) -> tuple[PolicySelection, dict[str, Any]]:
-    stale_aligned = stale_scores.reindex(fresh_scores.index).fillna(stale_scores.mean() if len(stale_scores) else 0.5)
-    delta = (fresh_scores - stale_aligned).fillna(0.0)
-    cutoff = float(delta.quantile(max(0.0, 1.0 - float(top_share)))) if len(delta) else float(score_delta_threshold)
-    reopt_mask = (delta >= max(float(score_delta_threshold), cutoff)) | (fresh_scores >= float(high_risk_threshold))
-    reopt_ids = set(delta.index[reopt_mask].astype(int).tolist())
+    stale_aligned, _ = _aligned_score_delta(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        absolute=True,
+    )
+    reopt_ids = select_partial_reopt_ids(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        score_delta_threshold=score_delta_threshold,
+        high_risk_threshold=high_risk_threshold,
+        top_share=top_share,
+    )
 
     if not reopt_ids:
-        return stale_selection, {'reoptimized_customers': 0, 'optimization_call_ratio': 0.0, 'regret_recovery_ratio': 0.0}
+        return stale_selection, {
+            'reoptimized_customers': 0,
+            'optimization_call_ratio': 0.0,
+            'regret_recovery_ratio': 0.0,
+            'stage1_partial_customers': 0,
+        }
 
     refreshed_scores = stale_aligned.copy()
-    refreshed_scores.loc[list(reopt_ids)] = fresh_scores.loc[list(reopt_ids)]
+    valid_ids = [cid for cid in reopt_ids if cid in refreshed_scores.index]
+    if valid_ids:
+        refreshed_scores.loc[valid_ids] = fresh_scores.loc[valid_ids]
     partial_selection = run_policy_selection(
         fresh_features=fresh_features,
         churn_scores=refreshed_scores,
@@ -446,8 +529,266 @@ def partial_reoptimization(
     base_value = float(stale_selection.summary['policy_value'])
     partial_value = float(partial_selection.summary['policy_value'])
     metadata = {
-        'reoptimized_customers': int(len(reopt_ids)),
-        'optimization_call_ratio': round(len(reopt_ids) / max(len(fresh_scores), 1), 6),
+        'reoptimized_customers': int(len(valid_ids)),
+        'optimization_call_ratio': round(len(valid_ids) / max(len(fresh_scores), 1), 6),
         'value_gain_vs_stale': round(partial_value - base_value, 6),
+        'stage1_partial_customers': int(len(valid_ids)),
     }
     return partial_selection, metadata
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Conformal Risk Control  &  Uncertainty-based refresh
+# ═══════════════════════════════════════════════════════════════════
+
+def compute_conformal_quantile(
+    residuals: np.ndarray,
+    alpha: float,
+) -> float:
+    """Split-conformal quantile with finite-sample correction.
+
+    Given calibration residuals R_1 … R_n and miscoverage level α,
+    returns q̂ = Quantile(R; ⌈(n+1)(1−α)⌉ / n) which guarantees
+    P(|s_fresh − s_stale| ≤ q̂) ≥ 1 − α marginally.
+    """
+    residuals = np.asarray(residuals, dtype=float)
+    n = len(residuals)
+    if n == 0:
+        return 1.0
+    level = min(np.ceil((n + 1) * (1.0 - float(alpha))) / n, 1.0)
+    return float(np.quantile(residuals, level))
+
+
+def conformal_partial_reoptimization(
+    *,
+    stale_scores: pd.Series,
+    fresh_scores: pd.Series,
+    fresh_features: pd.DataFrame,
+    stale_selection: PolicySelection,
+    budget: int,
+    scenario_family: str,
+    decision_date: str | pd.Timestamp,
+    conformal_q_hat: float,
+    use_learned_dose_response: bool = False,
+) -> tuple[PolicySelection, dict[str, Any]]:
+    """Selective re-optimization with conformal-calibrated threshold.
+
+    q̂ is the (1−α) quantile of calibration residuals |s_fresh − s_stale|
+    from previous decision weeks.  A customer whose actual score change
+    exceeds q̂ is "abnormally volatile" and therefore refreshed.
+
+    α controls the refresh fraction:
+      small α  →  high q̂  →  few refreshes  (strict)
+      large α  →  low  q̂  →  more refreshes (lenient)
+
+    Unlike a fixed θ, q̂ adapts automatically to the observed score
+    volatility in calibration data, eliminating manual threshold tuning.
+    """
+    stale_aligned = stale_scores.reindex(fresh_scores.index).fillna(
+        stale_scores.mean() if len(stale_scores) else 0.5,
+    )
+
+    # ── score change magnitude ──
+    delta = (fresh_scores - stale_aligned).abs().fillna(0.0)
+
+    # ── conformal threshold: refresh customers whose change exceeds q̂ ──
+    exceedance = delta > conformal_q_hat
+
+    # ── also include high-risk customers whose fresh score is extreme ──
+    high_risk = fresh_scores >= 0.80
+    reopt_mask = exceedance | high_risk
+    reopt_ids = set(stale_aligned.index[reopt_mask].astype(int).tolist())
+
+    if not reopt_ids:
+        return stale_selection, {
+            'reoptimized_customers': 0,
+            'optimization_call_ratio': 0.0,
+            'conformal_q_hat': round(conformal_q_hat, 6),
+            'method': 'conformal',
+        }
+
+    refreshed_scores = stale_aligned.copy()
+    valid_ids = [cid for cid in reopt_ids if cid in fresh_scores.index]
+    if valid_ids:
+        refreshed_scores.loc[valid_ids] = fresh_scores.loc[valid_ids]
+
+    selection = run_policy_selection(
+        fresh_features=fresh_features,
+        churn_scores=refreshed_scores,
+        budget=budget,
+        scenario_family=scenario_family,
+        decision_date=decision_date,
+        use_learned_dose_response=use_learned_dose_response,
+    )
+    return selection, {
+        'reoptimized_customers': int(len(valid_ids)),
+        'optimization_call_ratio': round(len(valid_ids) / max(len(fresh_scores), 1), 6),
+        'conformal_q_hat': round(conformal_q_hat, 6),
+        'method': 'conformal',
+    }
+
+
+
+def hierarchical_partial_crc_reoptimization(
+    *,
+    stale_scores: pd.Series,
+    fresh_scores: pd.Series,
+    fresh_features: pd.DataFrame,
+    stale_selection: PolicySelection,
+    budget: int,
+    scenario_family: str,
+    decision_date: str | pd.Timestamp,
+    score_delta_threshold: float,
+    high_risk_threshold: float,
+    top_share: float,
+    conformal_q_hat: float,
+    use_learned_dose_response: bool = False,
+) -> tuple[PolicySelection, dict[str, Any]]:
+    """Two-stage hierarchical refresh: partial re-optimization then CRC.
+
+    Stage 1 refreshes the low-cost partial re-optimization set. Stage 2
+    adds CRC-flagged customers among those not already refreshed, using the
+    conformal quantile learned from previous decision weeks. The final
+    policy is optimized once with the union of both refresh sets.
+    """
+    stale_aligned, _ = _aligned_score_delta(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        absolute=True,
+    )
+    stage1_ids = select_partial_reopt_ids(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        score_delta_threshold=score_delta_threshold,
+        high_risk_threshold=high_risk_threshold,
+        top_share=top_share,
+    )
+    stage2_ids = select_conformal_reopt_ids(
+        stale_scores=stale_scores,
+        fresh_scores=fresh_scores,
+        conformal_q_hat=conformal_q_hat,
+        high_risk_threshold=high_risk_threshold,
+        exclude_ids=stage1_ids,
+    )
+    total_ids = set(stage1_ids) | set(stage2_ids)
+
+    if not total_ids:
+        return stale_selection, {
+            'method': 'hierarchical_partial_crc',
+            'stage1_partial_customers': 0,
+            'stage2_crc_additional_customers': 0,
+            'reoptimized_customers': 0,
+            'stage1_partial_call_ratio': 0.0,
+            'stage2_crc_additional_call_ratio': 0.0,
+            'optimization_call_ratio': 0.0,
+            'conformal_q_hat': round(float(conformal_q_hat), 6),
+        }
+
+    refreshed_scores = stale_aligned.copy()
+    valid_total_ids = [cid for cid in total_ids if cid in refreshed_scores.index]
+    if valid_total_ids:
+        refreshed_scores.loc[valid_total_ids] = fresh_scores.loc[valid_total_ids]
+
+    selection = run_policy_selection(
+        fresh_features=fresh_features,
+        churn_scores=refreshed_scores,
+        budget=budget,
+        scenario_family=scenario_family,
+        decision_date=decision_date,
+        use_learned_dose_response=use_learned_dose_response,
+    )
+    n = max(len(fresh_scores), 1)
+    stage1_valid = [cid for cid in stage1_ids if cid in fresh_scores.index]
+    stage2_valid = [cid for cid in stage2_ids if cid in fresh_scores.index]
+    return selection, {
+        'method': 'hierarchical_partial_crc',
+        'stage1_partial_customers': int(len(stage1_valid)),
+        'stage2_crc_additional_customers': int(len(stage2_valid)),
+        'reoptimized_customers': int(len(valid_total_ids)),
+        'stage1_partial_call_ratio': round(len(stage1_valid) / n, 6),
+        'stage2_crc_additional_call_ratio': round(len(stage2_valid) / n, 6),
+        'optimization_call_ratio': round(len(valid_total_ids) / n, 6),
+        'conformal_q_hat': round(float(conformal_q_hat), 6),
+    }
+
+
+def select_uncertainty_reopt_ids(
+    ensemble_scores: list[pd.Series],
+    *,
+    k: int,
+) -> set[int]:
+    """Select the *k* customers with highest epistemic uncertainty.
+
+    Epistemic uncertainty is estimated as the variance of churn
+    predictions across an ensemble of models trained with different
+    random seeds.
+    """
+    if k <= 0 or not ensemble_scores:
+        return set()
+    aligned = pd.DataFrame(
+        {f'_m{i}': s for i, s in enumerate(ensemble_scores)},
+    )
+    variance = aligned.var(axis=1).fillna(0.0)
+    k = min(int(k), len(variance))
+    top_idx = variance.nlargest(k).index
+    return set(pd.Index(top_idx).astype(int).tolist())
+
+# A13 hierarchical update with call-budget defenses. Overrides earlier simple-union version.
+def _rank_hierarchical_refresh_ids(*, stage1_ids: set[int], stage2_ids: set[int], delta: pd.Series, fresh_scores: pd.Series, score_delta_threshold: float, conformal_q_hat: float, high_risk_threshold: float) -> list[int]:
+    union_ids = set(int(x) for x in stage1_ids) | set(int(x) for x in stage2_ids)
+    if not union_ids:
+        return []
+    eps = 1e-12
+    rows: list[tuple[float, float, float, int, int]] = []
+    for cid in union_ids:
+        movement = float(delta.get(cid, 0.0))
+        fresh = float(fresh_scores.get(cid, 0.0))
+        theta_margin = movement / max(float(score_delta_threshold), eps)
+        crc_margin = movement / max(float(conformal_q_hat), eps)
+        high_risk_bonus = 0.25 if fresh >= float(high_risk_threshold) else 0.0
+        crc_tiebreak = 0.05 if cid in stage2_ids else 0.0
+        priority = max(theta_margin, crc_margin) + high_risk_bonus + crc_tiebreak
+        rows.append((priority, movement, fresh, -int(cid), int(cid)))
+    rows.sort(reverse=True)
+    return [cid for *_unused, cid in rows]
+
+
+def hierarchical_partial_crc_reoptimization(*, stale_scores: pd.Series, fresh_scores: pd.Series, fresh_features: pd.DataFrame, stale_selection: PolicySelection, budget: int, scenario_family: str, decision_date: str | pd.Timestamp, score_delta_threshold: float, high_risk_threshold: float, top_share: float, conformal_q_hat: float, cap_mode: str = 'union', max_call_ratio: float | None = None, use_learned_dose_response: bool = False) -> tuple[PolicySelection, dict[str, Any]]:
+    """Two-stage Partial→CRC refresh with explicit call-cost controls.
+
+    cap_mode='union': Partial ∪ CRC upper-bound arm.
+    cap_mode='partial_cap': same-cost arm capped at Partial's call count.
+    cap_mode='fixed_cap': operational cap of floor(max_call_ratio × N).
+    """
+    stale_aligned, delta = _aligned_score_delta(stale_scores=stale_scores, fresh_scores=fresh_scores, absolute=True)
+    n = max(len(fresh_scores), 1)
+    stage1_ids = select_partial_reopt_ids(stale_scores=stale_scores, fresh_scores=fresh_scores, score_delta_threshold=score_delta_threshold, high_risk_threshold=high_risk_threshold, top_share=top_share)
+    stage2_candidate_ids = select_conformal_reopt_ids(stale_scores=stale_scores, fresh_scores=fresh_scores, conformal_q_hat=conformal_q_hat, high_risk_threshold=high_risk_threshold, exclude_ids=stage1_ids)
+    union_ids = set(stage1_ids) | set(stage2_candidate_ids)
+    cap_mode = str(cap_mode or 'union')
+    if cap_mode == 'union':
+        budget_cap_customers = len(union_ids)
+        final_ids = set(union_ids)
+    elif cap_mode == 'partial_cap':
+        budget_cap_customers = len(stage1_ids)
+        ranked = _rank_hierarchical_refresh_ids(stage1_ids=stage1_ids, stage2_ids=stage2_candidate_ids, delta=delta, fresh_scores=fresh_scores, score_delta_threshold=score_delta_threshold, conformal_q_hat=conformal_q_hat, high_risk_threshold=high_risk_threshold)
+        final_ids = set(ranked[:max(0, min(int(budget_cap_customers), len(ranked)))])
+    elif cap_mode == 'fixed_cap':
+        budget_cap_customers = len(stage1_ids) if max_call_ratio is None else int(np.floor(max(0.0, min(float(max_call_ratio), 1.0)) * n))
+        ranked = _rank_hierarchical_refresh_ids(stage1_ids=stage1_ids, stage2_ids=stage2_candidate_ids, delta=delta, fresh_scores=fresh_scores, score_delta_threshold=score_delta_threshold, conformal_q_hat=conformal_q_hat, high_risk_threshold=high_risk_threshold)
+        final_ids = set(ranked[:max(0, min(int(budget_cap_customers), len(ranked)))])
+    else:
+        raise ValueError(f'Unsupported hierarchical cap_mode: {cap_mode}')
+    n_float = float(n)
+    if not final_ids:
+        return stale_selection, {'method':'hierarchical_partial_crc','cap_mode':cap_mode,'stage1_partial_customers':int(len(stage1_ids)),'stage2_crc_candidate_customers':int(len(stage2_candidate_ids)),'stage1_partial_retained_customers':0,'stage2_crc_retained_customers':0,'stage2_crc_additional_customers':0,'dropped_union_customers':int(len(union_ids)),'budget_cap_customers':int(budget_cap_customers),'reoptimized_customers':0,'stage1_partial_call_ratio':round(len(stage1_ids)/n_float,6),'stage2_crc_candidate_call_ratio':round(len(stage2_candidate_ids)/n_float,6),'stage2_crc_additional_call_ratio':0.0,'optimization_call_ratio':0.0,'conformal_q_hat':round(float(conformal_q_hat),6)}
+    refreshed_scores = stale_aligned.copy()
+    valid_total_ids = [cid for cid in final_ids if cid in refreshed_scores.index]
+    if valid_total_ids:
+        refreshed_scores.loc[valid_total_ids] = fresh_scores.loc[valid_total_ids]
+    selection = run_policy_selection(fresh_features=fresh_features, churn_scores=refreshed_scores, budget=budget, scenario_family=scenario_family, decision_date=decision_date, use_learned_dose_response=use_learned_dose_response)
+    final_set = set(valid_total_ids)
+    stage1_retained = final_set & set(stage1_ids)
+    stage2_retained = final_set & set(stage2_candidate_ids)
+    return selection, {'method':'hierarchical_partial_crc','cap_mode':cap_mode,'stage1_partial_customers':int(len(stage1_ids)),'stage2_crc_candidate_customers':int(len(stage2_candidate_ids)),'stage1_partial_retained_customers':int(len(stage1_retained)),'stage2_crc_retained_customers':int(len(stage2_retained)),'stage2_crc_additional_customers':int(len(stage2_retained)),'dropped_union_customers':int(len(union_ids-final_set)),'budget_cap_customers':int(budget_cap_customers),'reoptimized_customers':int(len(valid_total_ids)),'stage1_partial_call_ratio':round(len(stage1_ids)/n_float,6),'stage2_crc_candidate_call_ratio':round(len(stage2_candidate_ids)/n_float,6),'stage2_crc_additional_call_ratio':round(len(stage2_retained)/n_float,6),'optimization_call_ratio':round(len(valid_total_ids)/n_float,6),'conformal_q_hat':round(float(conformal_q_hat),6)}
+
